@@ -8,6 +8,12 @@ tags: [performance, benchmark, ais-bench, ttft, throughput, kv-pool]
 
 # AIS-Bench 性能测试 Skill
 
+## 前置条件
+
+本 skill 依赖以下 skill 已完成：
+- `cann-npu-deploy` → NPU 驱动 + CANN 已安装，容器已运行
+- `deploy-vllm-on-ascend` → vLLM 推理服务已启动且 smoke test 通过
+
 ## 触发条件
 
 当用户提出以下类型的需求时触发：
@@ -115,6 +121,25 @@ TTFT分布通常有双峰：
 需要根据命中率综合分析。
 
 ## 标准工作流 (SOP)
+
+### Phase 0: 前置预检
+
+1. **检查 Redis 是否运行**（Mooncake 依赖 Redis 作为 metadata 后端）
+```bash
+redis-cli ping  # 应返回 PONG
+# 如果 Redis 未运行，先启动：
+# redis-server --daemonize yes
+```
+
+2. **检查 NPU 利用率**（确保非NVIDIA环境）
+```bash
+npu-smi info  # 确认所有 NPU 卡状态正常
+```
+
+3. **运行预检脚本**
+```bash
+bash /root/.config/opencode/skills/run-ais-bench-performance/scripts/verify.sh
+```
 
 ### Phase 1: 环境准备
 
@@ -284,92 +309,16 @@ curl -s http://localhost:50088/metrics | grep -E "hit|query"
 
 ### 常见问题排查
 
-#### 问题1：命中率远低于预期
-**症状**：repeat_rate=0.9 但 external_hit_rate < 50%
-
-**排查**：
-```bash
-# 1. 检查是否启用prefix caching
-curl -s http://localhost:8100/v1/models | grep prefix_caching
-
-# 2. 检查KV Pool后端是否正常运行
-curl -s http://localhost:50088/metrics
-
-# 3. 查看Mooncake master日志
-tail -100 mooncake_master.log
-```
-
-**可能原因**：
-- vLLM未启动`--enable-prefix-caching`
-- mooncake_master未运行
-- KV connector配置不正确
-
-#### 问题2：TTFT 异常高
-**症状**：ttft_avg_ms > 1000
-
-**排查**：
-```bash
-# 1. 检查模型加载状态
-curl -s http://localhost:8192/v1/models
-
-# 2. 查看vLLM服务器日志
-tail -100 vllm_server.log
-
-# 3. 检查CPU/内存使用率
-top -bn1 | grep -E "CPU|Mem"
-```
-
-**可能原因**：
-- 模型首次加载需要时间
-- 系统负载过高
-- KV buffer size 过小
-
-#### 问题3：吞吐量异常低
-**症状**：request_throughput < 10 req/s
-
-**排查**：
-```bash
-# 1. 检查并发数配置
-# 确保 --concurrency 参数合理（通常 20-50）
-
-# 2. 检查是否有请求排队
-curl -s http://localhost:8100/metrics | grep queue
-
-# 3. 查看GPU利用率
-nvidia-smi
-```
-
-**可能原因**：
-- 并发数过小
-- GPU利用率瓶颈
-- 网络延迟
-
-#### 问题4：数据集目录不存在
-**症状**：Error: Dataset directory /home/dataset does not exist
-
-**排查**：
-```bash
-# 创建目录
-mkdir -p /home/dataset
-
-# 验证
-ls -la /home/dataset
-```
-
-#### 问题5：工具配置未生效
-**症状**：工具使用默认的config.py，而不是自定义配置
-
-**排查**：
-```bash
-# 1. 确认config.py在工具根目录
-ls -la /opt/aisbench_auto_tools_prefix/config.py
-
-# 2. 检查JSON格式
-cat /opt/aisbench_auto_tools_prefix/config.py | python3 -m json.tool
-
-# 3. 确认路径正确
-cat /opt/aisbench_auto_tools_prefix/config.py
-```
+| 症状 | 根因 | 修复动作 |
+|------|------|---------|
+| repeat_rate=0.9 但 external_hit_rate < 50% | vLLM 未启用 `--enable-prefix-caching`，或 mooncake_master 未运行，或 KV connector 配置错误 | 检查启动参数含 `--enable-prefix-caching`；`pgrep -f mooncake_master` 确认进程；`curl -s http://localhost:50088/metrics` 验证 Mooncake |
+| ttft_avg_ms > 1000 | 模型 fake-ready（启动日志显示 ready 但首次请求失败）、系统负载过高、KV buffer size 过小 | smoke chat 验证模型可用：`curl /v1/chat/completions`；`npu-smi info` 检查 NPU |
+| request_throughput < 10 req/s | 并发数过小、NPU 利用率瓶颈、网络延迟 | 增大 `--concurrency`（建议 20-50）；`npu-smi info` 检查利用率 |
+| `Error: Dataset directory not found` | /home/dataset 目录不存在 | `mkdir -p /home/dataset` 后重新运行 |
+| 工具使用默认 config.py 而非自定义配置 | config.py JSON 格式错误，或路径不在工具根目录 | `python3 -m json.tool < config.py` 验证 JSON 格式 |
+| `ConnectionError: Redis refused` | Redis 未运行，Mooncake 元数据后端不可用 | `redis-server --daemonize yes` 后重启 mooncake_master |
+| `mooncake_master: command not found` | Mooncake 未安装或未加入 PATH | 确认 `/vllm-workspace/Mooncake` 已编译并 export PATH |
+| `nvidia-smi: command not found` | 误用了 NVIDIA 命令，本环境是昇腾 NPU | 使用 `npu-smi info` 替代 |
 
 ## 高级技巧
 
@@ -440,3 +389,16 @@ done
 - 2026-06-09: 初始版本，基于DeepSeek-V2-Lite-Chat模型验证
 - 2026-06-09: 添加prefix cache测试支持，验证90%重复率场景
 - 2026-06-09: 优化核心约束，强调output_len=1和request_rate=0的重要性
+- 2026-06-10: 修复 nvidia-smi 为 npu-smi，添加 Phase 0 Redis 预检，添加 verify.sh，统一排障格式，添加跨 skill 导航
+
+## 导航
+
+### 前置 Skill
+| Skill | 说明 |
+|-------|------|
+| `cann-npu-deploy` | NPU 驱动 + CANN + Docker 环境搭建 |
+| `deploy-vllm-on-ascend` | vLLM 编译安装 + 推理服务启动 |
+
+### 后续步骤
+- 性能测试完成后，运行精度测试 → 调用 `run-ais-bench-accuracy` skill
+- 如需重新部署服务 → 调用 `deploy-vllm-on-ascend` skill

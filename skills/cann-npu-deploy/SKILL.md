@@ -22,6 +22,17 @@ description: >
 - 在容器内安装工具（如 opencode）
 - 排查 NPU 相关安装问题
 
+## 硬约束（不可违反）
+
+| # | 约束 | 原因 |
+|---|------|------|
+| 1 | CANN 安装顺序必须为 Toolkit → Ops → NNAL | Ops 依赖 Toolkit 环境，NNAL 依赖两者；乱序会导致编译失败 |
+| 2 | 安装 Ops 前必须 `source ascend-toolkit/set_env.sh` | Ops 安装脚本需要 Toolkit 环境变量，不 source 会报错退出 |
+| 3 | 下载 CANN .run 包使用 `$(uname -m)` 而非 `$(uname -i)` | 某些 openEuler 版本 `uname -i` 返回 `unknown`，导致 404 下载失败 |
+| 4 | `--shm-size=8g` 是容器必须参数 | 大模型推理共享内存需求大，默认 64MB 会立即 OOM |
+| 5 | 非交互终端安装 CANN，必须用 .run 包 + `--quiet` | yum 在非交互终端下访问 `/dev/tty` 会静默失败 |
+| 6 | pip 安装任何包必须加 `--no-build-isolation` | 详见 `@_shared/references/pip-build-isolation.md` |
+
 ## 工作流程总览
 
 ```
@@ -404,6 +415,12 @@ docker exec <容器名> bash -c "
 
 ## 安装后全局验证
 
+### 一键验证
+
+```bash
+bash /root/.config/opencode/skills/cann-npu-deploy/scripts/verify.sh
+```
+
 ### 验证清单
 
 | 检查项 | 命令 | 期望结果 |
@@ -417,6 +434,27 @@ docker exec <容器名> bash -c "
 | Docker | `docker ps` | 容器运行中 |
 | 容器内 NPU | `docker exec <容器名> npu-smi info` | 容器内可见 NPU |
 
+## 回滚 / 卸载（覆盖安装时使用）
+
+如需彻底清除环境重新安装，按以下顺序卸载：
+
+```bash
+# 1. 卸载 NNAL
+rm -rf /usr/local/Ascend/nnal
+
+# 2. 卸载 CANN Toolkit（包含 Ops）
+rm -rf /usr/local/Ascend/ascend-toolkit
+
+# 3. 卸载 NPU 驱动（谨慎操作）
+# .run 包安装: 使用 --uninstall 参数
+# yum 安装: yum remove Ascend910B-driver
+
+# 4. 清理环境变量
+rm -f /etc/profile.d/ascend.sh
+```
+
+> **注意**: 卸载驱动后需 `reboot` 使设备状态重置。
+
 ---
 
 ## 常见问题
@@ -429,6 +467,9 @@ docker exec <容器名> bash -c "
 | npm 安装报 404 not found | npm registry 指向了华为云镜像 | `npm config set registry https://registry.npmjs.org` |
 | 驱动安装报 `ifconfig: command not found` | 缺少 net-tools | `yum install -y net-tools` 或忽略（不影响功能） |
 | 容器内 `npu-smi` 找不到命令 | 未挂载 npu-smi 二进制 | 确保 `-v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi` |
+| CANN 安装后 `ASCEND_HOME` 环境变量为空 | 未 source set_env.sh 或未配置 profile.d | `source /etc/profile.d/ascend.sh` 后检查，或重新执行 Phase 4 配置步骤 |
+| 容器启动后被 OOM killed | `--shm-size` 过小（默认 64MB） | 重新创建容器，指定 `--shm-size=8g` |
+| 覆盖安装 CANN Ops 报 `Toolkit not found` | 安装 Ops 前未 source Toolkit 环境 | `source /usr/local/Ascend/ascend-toolkit/set_env.sh` 后重试 |
 
 ---
 
@@ -443,3 +484,16 @@ docker exec <容器名> bash -c "
 <!-- 以下参考文件仅限本机，其他环境无此文件 -->
 - 参考创建容器方式（本机）: `/root/vllm-ascend-skill/vllm-ascend创建容器方式.txt`
 - vllm,vllm-ascend,Mooncake 编译安装方式（本机）: `/root/vllm-ascend-skill/安装编译vllm,vllm-ascend,Mooncake的方式.txt`
+
+## 共享约束索引
+
+| 约束内容 | 所在共享文件 |
+|---------|------------|
+| pip install --no-build-isolation | `@_shared/references/pip-build-isolation.md` |
+
+## 导航
+
+### 后续 Skill
+| Skill | 说明 |
+|-------|------|
+| `deploy-vllm-on-ascend` | vLLM 编译安装 + 推理服务启动（Phase 6 容器就绪后执行） |

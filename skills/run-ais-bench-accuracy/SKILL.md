@@ -5,6 +5,12 @@ description: 执行 AISBench 精度测试的完整工作流。当用户要求测
 
 # AISBench 精度测试工作流
 
+## 前置条件
+
+本 skill 依赖以下 skill 已完成：
+- `cann-npu-deploy` → NPU 驱动 + CANN 已安装，容器已运行
+- `deploy-vllm-on-ascend` → vLLM 推理服务已启动且 smoke test 通过
+
 ## 触发条件
 
 当用户的需求符合以下特征时触发：
@@ -68,24 +74,9 @@ AttributeError: module 'vllm' has no attribute 'SamplingParams'
 AttributeError: module 'vllm' has no attribute 'ModelRegistry'
 ```
 
-这是因为 `vllm/__init__.py` 使用延迟加载，而某些模块在 `__init__` 执行期间就被导入了。**修复方法**：
-
+详见共享约束：`@_shared/references/vllm-circular-import-patches.md`，或直接运行：
 ```bash
-# 进入 vllm 源码目录
-cd /vllm-workspace/vllm
-
-# 编辑 vllm/__init__.py，将这些符号添加到 __all__ 列表
-nano vllm/__init__.py
-```
-
-在 `__all__ = [...]` 中添加：
-```python
-__all__ = [
-    # ... existing entries ...
-    "SamplingParams",
-    "ModelRegistry",
-    # 根据报错添加其他符号
-]
+bash /root/.config/opencode/skills/deploy-vllm-on-ascend/references/apply-vllm-v0.20.x-patches.sh
 ```
 
 ### 6. 评测前必须验证服务状态
@@ -128,6 +119,10 @@ python3 /vllm-workspace/ais-benchmark/download_gsm8k.py
 
 ### Phase 1: 环境验证
 ```bash
+# 运行预检脚本（一键验证所有前置条件）
+bash /root/.config/opencode/skills/run-ais-bench-accuracy/scripts/verify.sh
+
+# 或逐项检查：
 # Step 1.1: 确认容器启动
 docker ps
 
@@ -282,74 +277,15 @@ echo "| GSM8K  | 72.0%    | XX.X%    | X.X% |"
 
 ## 常见问题排查
 
-### Q1: 评测卡住不动
-**症状**：日志长时间无新输出
-
-**诊断**：
-```bash
-# 检查进程
-ps aux | grep ais_bench
-
-# 检查是否有僵尸进程
-ps aux | grep defunct
-
-# 查看完整日志
-cat /tmp/gsm8k_v1.log | tail -100
-```
-
-**解决**：
-```bash
-# 杀死卡住的进程
-kill -9 <pid>
-
-# 清理并重新运行
-rm -rf /tmp/gsm8k_v1
-# 重新执行 Phase 3
-```
-
-### Q2: 准确率异常低（如 <30%）
-**可能原因**：
-1. 模型未正确加载（检查 vLLM 服务）
-2. 数据集路径错误
-3. 后处理逻辑错误
-4. 温度参数过高
-
-**诊断**：
-```bash
-# 验证服务
-curl -s http://localhost:8100/v1/models
-
-# 检查数据集
-head -5 /vllm-workspace/ais-benchmark/ais_bench/datasets/gsm8k/test.jsonl
-
-# 检查后处理
-python3 -c "from ais_bench.benchmark.datasets.gsm8k import gsm8k_postprocess; print(gsm8k_postprocess('answer: 42'))"
-
-# 检查模型配置
-cat /vllm-workspace/ais-benchmark/ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_chat.py
-```
-
-### Q3: 评测框架报错
-**常见错误**：
-```
-ModuleNotFoundError: No module named 'mmengine'
-```
-
-**解决**：
-```bash
-pip install --no-build-isolation mmengine==0.10.4
-# 或安装完整依赖
-pip install --no-build-isolation -r /vllm-workspace/ais-benchmark/requirements/runtime.txt
-```
-
-### Q4: 结果与官方差距过大
-**可能原因**：
-1. 评测配置不同（few-shot vs 0-shot）
-2. 温度参数不同
-3. 后处理逻辑不同
-4. 模型精度不同（fp16 vs fp32）
-
-**处理**：不进行强行调优，记录差异原因并向用户报告。
+| 症状 | 根因 | 修复动作 |
+|------|------|---------|
+| 评测日志长时间无新输出（卡住） | ais_bench 进程挂起，或 vLLM 服务请求超时 | `kill -9 <pid>` 后清除 `/tmp/<workdir>` 重新运行 |
+| 准确率异常低（<30%） | 模型未正确加载（fake-ready）、数据集路径错误、后处理逻辑 bug、温度参数 >0 | smoke chat 验证模型可用；检查 `test.jsonl` 路径；`gsm8k_postprocess("answer: 42")` 测试后处理 |
+| `ModuleNotFoundError: No module named 'mmengine'` | ais-bench 运行时依赖未安装 | `pip install --no-build-isolation mmengine==0.10.4` 或 `-r requirements/runtime.txt` |
+| 结果与官方差距 >20% | 评测配置不同（few-shot vs 0-shot）、温度参数不同、后处理逻辑不同、模型量化精度不同 | 不强行调优，记录差异原因并向用户报告 |
+| `ConnectionRefusedError` on port 8100 | vLLM 服务未启动或已崩溃 | 先调用 `deploy-vllm-on-ascend` skill 重新部署 |
+| 使用 stream_chat 配置测试 non-streaming 模型 | 配置类型与模型启动参数不匹配 | 检查 `--enable-streaming` 参数，选择对应配置 |
+| 评测器将 "65,000" 误判为 "000" | gsm8k_postprocess 未处理千位分隔符（已知 bug） | 参考案例1，修复后处理逻辑后重新评测 |
 
 ## 案例记录
 
@@ -440,3 +376,24 @@ def gsm8k_postprocess(text: str) -> str:
     # 返回最后一个数字
     return numbers[-1] if numbers else ''
 ```
+
+### 附录 E: 共享约束索引
+
+| 约束内容 | 所在共享文件 |
+|---------|------------|
+| pip install --no-build-isolation | `@_shared/references/pip-build-isolation.md` |
+| vllm 循环导入补丁 | `@_shared/references/vllm-circular-import-patches.md` |
+| "假就绪"检测 | `@_shared/references/false-ready-detection.md` |
+| torch-npu 版本配对 | `@@shared/references/torch-npu-version-pairing.md` |
+
+## 导航
+
+### 前置 Skill
+| Skill | 说明 |
+|-------|------|
+| `cann-npu-deploy` | NPU 驱动 + CANN + Docker 环境搭建 |
+| `deploy-vllm-on-ascend` | vLLM 编译安装 + 推理服务启动 |
+
+### 后续步骤
+- 精度测试完成后，运行性能测试 → 调用 `run-ais-bench-performance` skill
+- 如需重新部署服务 → 调用 `deploy-vllm-on-ascend` skill
