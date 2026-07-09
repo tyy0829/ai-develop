@@ -26,9 +26,7 @@ the forward pass rather than concentrated as a single blocking step. We implemen
 this for the memcache backend in
 [#11444](https://github.com/vllm-project/vllm-ascend/pull/11444) (backported to
 `releases/v0.23.0` as
-[#11585](https://github.com/vllm-project/vllm-ascend/pull/11585)), and verified it
-on DeepSeek-V2-Lite-Chat (MLA, 27 layers, TP=8): **+16% TTFT** vs non-layerwise,
-**87.2% external hit rate** (repeat_rate=0.9), GSM8K accuracy 69.9% (official 72.0%).
+[#11585](https://github.com/vllm-project/vllm-ascend/pull/11585)).
 
 However, during implementation we found that memcache and mooncake have
 **fundamentally different addressing and transfer models**, which forces the
@@ -41,15 +39,6 @@ layerwise path to fork into two parallel implementations:
 - mooncake is **key-based**: one object is stored per (block, layer, rank); the store
   manages placement internally. The transfer is a `batch_put` / `batch_get` over the
   transfer engine, with no GVA and no lease.
-
-This divergence is non-obvious and lightly documented today — a contributor reading
-the code sees two large thread-class hierarchies selected by a single flag
-(`use_gva_layerwise = use_layerwise and backend == "memcache"`). This RFC documents
-the design and the divergence, and asks for feedback on whether the abstraction
-should be unified and whether layerwise should be extended to mooncake. It is a
-companion to the user guide
-[`layerwise_kv_pool.md`](https://github.com/vllm-project/vllm-ascend/blob/releases/v0.23.0/docs/source/user_guide/feature_guide/layerwise_kv_pool.md)
-shipped with the PR.
 
 ## Proposed Change.
 
@@ -65,18 +54,21 @@ optionally `i+1..i+k` via `layerwise_prefetch_layers`). A per-layer NPU stream e
 the attention op) makes prefetch loads start only at the attention boundary, so H2D /
 L2G work does not contend with the preceding non-attention compute.
 
-```
- Producer (kv_producer / kv_both)            Consumer (kv_consumer / kv_both)
- ┌──────────────┐                            ┌──────────────┐
- │ attn layer 0 │─┐                          │ wait load L0 │←─ recv thread prefetches L0
- └──────────────┘ │─ send thread copies L0   └──────────────┘
- ┌──────────────┐ │   to pool (overlaps ──►) ┌──────────────┐
- │ attn layer 1 │─┘                          │ attn layer 0 │─┐  recv prefetches L1
- └──────────────┘─ send thread copies L1     └──────────────┘ │  (overlaps ──►)
- ┌──────────────┐   (overlaps ──►)           ┌──────────────┐ │
- │ attn layer 2 │                            │ wait load L1 │←┘
- └──────────────┘                            └──────────────┘
-       ...                                          ...
+```mermaid
+gantt
+    title Layerwise pipeline — KV transfer overlaps with attention compute
+    dateFormat X
+    axisFormat %s
+    section Producer (save)
+    attn L0           :p1, 0, 10
+    save L0 to pool   :p2, after p1, 10
+    attn L1           :p3, after p1, 10
+    save L1 to pool   :p4, after p3, 10
+    section Consumer (load)
+    load L0 from pool :c1, 0, 10
+    attn L0           :c2, after c1, 10
+    load L1 from pool :c3, after c1, 10
+    attn L1           :c4, after c2, 10
 ```
 
 What **differs** between the two backends is everything *inside* the send/recv
