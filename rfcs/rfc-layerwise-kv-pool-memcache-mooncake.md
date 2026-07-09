@@ -55,21 +55,28 @@ the attention op) makes prefetch loads start only at the attention boundary, so 
 L2G work does not contend with the preceding non-attention compute.
 
 ```mermaid
-gantt
-    title Layerwise pipeline — KV transfer overlaps with attention compute
-    dateFormat X
-    axisFormat %s
-    section Producer (save)
-    attn L0           :p1, 0, 10
-    save L0 to pool   :p2, after p1, 10
-    attn L1           :p3, after p1, 10
-    save L1 to pool   :p4, after p3, 10
-    section Consumer (load)
-    load L0 from pool :c1, 0, 10
-    attn L0           :c2, after c1, 10
-    load L1 from pool :c3, after c1, 10
-    attn L1           :c4, after c2, 10
+flowchart LR
+    subgraph P["Producer — save overlaps next-layer compute"]
+        direction TB
+        P0["attn L0"] --> P1["attn L1"]
+        P0 -. "async" .-> S0["save L0 → pool"]
+        P1 --> P2["attn L2"]
+        P1 -. "async" .-> S1["save L1 → pool"]
+    end
+    subgraph C["Consumer — load overlaps current-layer compute"]
+        direction TB
+        L0["load L0 ← pool"] --> C0["attn L0"]
+        C0 --> C1["attn L1"]
+        C0 -. "async" .-> L1["load L1 ← pool"]
+        C1 -. "async" .-> L2["load L2 ← pool"]
+    end
 ```
+
+*Solid arrow = sequential dependency (the next step waits); dashed `async` arrow = a
+transfer spawned in parallel with the adjacent compute. The fork after each `attn Lx`
+is the overlap: on the producer, `save Lx` runs while `attn L(x+1)` computes; on the
+consumer, `load L(x+1)` is prefetched while `attn Lx` computes — so the transfer
+stall is hidden.*
 
 What **differs** between the two backends is everything *inside* the send/recv
 threads: the addressing model, the store API, the allocation site, the lease
